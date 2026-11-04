@@ -1,0 +1,2 @@
+[functions.cleanup-room]
+verify_jwt = true
