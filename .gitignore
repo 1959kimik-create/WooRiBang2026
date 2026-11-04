@@ -1,7 +1,6 @@
 .vercel
 node_modules
-.env
-.env.*
+.env*
 !.env.example
 *.local
 *.log
