@@ -43,6 +43,11 @@
     localMediaStream: null,
     cameraEnabled: false,
     microphoneEnabled: false,
+    roomChannel: null,
+    presenceParticipants: [],
+    peerConnections: new Map(),
+    remoteStreams: new Map(),
+    remoteAudioBlocked: false,
     microphoneRecoveryPromise: null,
     currentName: "",
     language: "ko",
@@ -733,22 +738,21 @@
       ["txt", "csv", "docx", "xls", "xlsx", "pptx"].includes(fileExtension(activeShare.name))) {
       prepareDocumentPreview(activeShare);
     }
-    const participants = state.backendReady
-      ? state.participants.map((participant) => ({
-        name: participant.display_name,
-        self: participant.user_id === state.userId
-      }))
-      : [{ name: state.currentName || "나", self: true }];
+    const participants = meetingParticipants();
     const participantCards = participants.map((participant, index) => `<button class="participant-tile" data-action="participant-preview" data-index="${index}" aria-label="${escapeHtml(participant.name)} 참가자 영상 미리보기">
-      ${participant.self && state.cameraEnabled
-        ? `<video class="participant-video" data-local-preview muted autoplay playsinline></video>`
+      ${participant.cameraEnabled && (participant.self ? state.localMediaStream : participant.stream)
+        ? `<video class="participant-video" ${participant.self ? 'data-local-preview muted' : `data-remote-preview="${escapeHtml(participant.id)}" muted`} autoplay playsinline></video>`
         : `<span class="participant-avatar">${escapeHtml(participant.name.slice(0, 1))}</span>`}
       <strong>${escapeHtml(participant.name)}${participant.self ? " (나)" : ""}</strong>
-      <span class="participant-status" aria-label="${participant.self ? "내 장치 상태" : "장치 상태 미연결"}">
-        <span class="participant-device camera-status ${participant.self ? (state.cameraEnabled ? "is-on" : "is-off") : "is-unknown"}" title="${participant.self ? `카메라 ${state.cameraEnabled ? "ON" : "OFF"}` : "카메라 상태 미연결"}" aria-label="${participant.self ? `카메라 ${state.cameraEnabled ? "ON" : "OFF"}` : "카메라 상태 미연결"}">C</span>
-        <span class="participant-device microphone-status ${participant.self ? (state.microphoneEnabled ? "is-on" : "is-off") : "is-unknown"}" title="${participant.self ? `마이크 ${state.microphoneEnabled ? "ON" : "OFF"}` : "마이크 상태 미연결"}" aria-label="${participant.self ? `마이크 ${state.microphoneEnabled ? "ON" : "OFF"}` : "마이크 상태 미연결"}">M</span>
+      <span class="participant-status" aria-label="${participant.self ? "내 장치 상태" : participant.presence ? "상대 장치 상태" : "장치 상태 미연결"}">
+        <span class="participant-device camera-status ${participant.presence ? (participant.cameraEnabled ? "is-on" : "is-off") : "is-unknown"}" title="${participant.presence ? `카메라 ${participant.cameraEnabled ? "ON" : "OFF"}` : "카메라 상태 미연결"}" aria-label="${participant.presence ? `카메라 ${participant.cameraEnabled ? "ON" : "OFF"}` : "카메라 상태 미연결"}">C</span>
+        <span class="participant-device microphone-status ${participant.presence ? (participant.microphoneEnabled ? "is-on" : "is-off") : "is-unknown"}" title="${participant.presence ? `마이크 ${participant.microphoneEnabled ? "ON" : "OFF"}` : "마이크 상태 미연결"}" aria-label="${participant.presence ? `마이크 ${participant.microphoneEnabled ? "ON" : "OFF"}` : "마이크 상태 미연결"}">M</span>
       </span>
     </button>`).join("");
+    const remoteAudio = participants
+      .filter((participant) => !participant.self && participant.stream)
+      .map((participant) => `<audio data-remote-audio="${escapeHtml(participant.id)}" autoplay></audio>`)
+      .join("");
     app.innerHTML = `<main class="page meeting-page">
       <header class="meeting-topbar">
         <div class="meeting-title"><button class="brand" data-action="home" aria-label="우리방 초기 화면">WOO RI BANG</button><h1>${booking.room} 토론방</h1></div>
@@ -760,8 +764,10 @@
         <div class="device-controls" aria-label="내 장치 상태">
           <button class="button device-toggle ${state.cameraEnabled ? "is-on" : "is-off"}" type="button" data-action="toggle-device" data-device="camera" aria-label="카메라 ${state.cameraEnabled ? "ON" : "OFF"}" aria-pressed="${state.cameraEnabled}" title="${state.cameraEnabled ? "카메라 켜짐" : "카메라 꺼짐"}">카메라</button>
           <button class="button device-toggle ${state.microphoneEnabled ? "is-on" : "is-off"}" type="button" data-action="toggle-device" data-device="microphone" aria-label="마이크 ${state.microphoneEnabled ? "ON" : "OFF"}" aria-pressed="${state.microphoneEnabled}" title="${state.microphoneEnabled ? "마이크 켜짐" : "마이크 꺼짐"}">마이크</button>
+          ${state.remoteAudioBlocked ? `<button class="button secondary small-button" type="button" data-action="enable-remote-audio">상대 소리 재생</button>` : ""}
         </div>
       </section>
+      ${remoteAudio}
       <section class="meeting-layout">
         <section class="panel share-column" aria-label="공유 화면">
           <div class="share-stage" id="share-stage"><div class="share-content" style="--share-zoom:${state.shareZoom}">${shared}</div></div>
@@ -803,7 +809,29 @@
       </section>
       <input class="visually-hidden" id="share-file-input" type="file" accept="image/*,video/*,application/pdf,text/plain,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.zip">
     </main>`;
-    attachLocalPreview();
+    attachMediaPreviews();
+    if (remoteAudio) {
+      for (const audio of document.querySelectorAll("[data-remote-audio]")) {
+        const stream = state.remoteStreams.get(audio.dataset.remoteAudio);
+        if (!stream) continue;
+        if (audio.srcObject !== stream) audio.srcObject = stream;
+        void audio.play().then(() => {
+          if (state.remoteAudioBlocked) {
+            state.remoteAudioBlocked = false;
+            if (state.page === "meeting") renderMeeting();
+          }
+        }).catch((error) => {
+          if (error.name === "NotAllowedError") {
+            if (!state.remoteAudioBlocked) {
+              state.remoteAudioBlocked = true;
+              if (state.page === "meeting") renderMeeting();
+            }
+          } else {
+            console.error("Could not play a participant's audio.", error);
+          }
+        });
+      }
+    }
     const log = document.querySelector("#chat-log");
     if (log) log.scrollTop = log.scrollHeight;
     updateMeetingClock();
@@ -904,6 +932,7 @@
         }
         state.localMediaStream.addTrack(nextTrack);
         watchMicrophoneTrack(nextTrack);
+        await Promise.all([...state.peerConnections.values()].map((peer) => syncPeerMedia(peer)));
         toast("연결된 사용 가능 마이크로 자동 전환했습니다.");
       } catch (error) {
         console.error("Could not switch to another available microphone.", error);
@@ -923,6 +952,9 @@
           state.recognitionStatus = "off";
           stopSpeechRecognition();
         }
+        syncPresence();
+        await Promise.all([...state.peerConnections.values()].map((peer) => syncPeerMedia(peer)))
+          .catch((syncError) => console.error("Could not update the unavailable microphone track.", syncError));
         toast("사용 가능한 마이크로 자동 전환하지 못했습니다. 마이크 연결과 브라우저 권한을 확인해 주세요.", true);
       } finally {
         state.microphoneRecoveryPromise = null;
@@ -939,47 +971,245 @@
   }
 
   function openSharedFilesDialog() {
-    const files = state.sharedItems.map((item, index) => `<button class="shared-file-row" data-modal-action="select-shared" data-index="${index}" ${state.activeShareIndex >= 0 ? "disabled" : ""}>
-      <span class="shared-file-icon" aria-hidden="true">${item.kind === "link" ? "↗" : "▤"}</span><span>${escapeHtml(item.name)}</span><span>${state.activeShareIndex === index ? "화면에 표시 중" : "열기"}</span>
-    </button>`).join("");
+    const files = state.sharedItems.map((item, index) => `<div class="shared-file-row">
+      <span class="shared-file-icon" aria-hidden="true">${item.kind === "link" ? "↗" : "▤"}</span>
+      <span>${escapeHtml(item.name)}</span>
+      <span class="shared-file-actions">
+        <button class="button secondary small-button" data-modal-action="select-shared" data-index="${index}" ${state.activeShareIndex >= 0 ? "disabled" : ""}>${state.activeShareIndex === index ? "표시 중" : "열기"}</button>
+        <button class="button danger small-button" data-modal-action="ask-delete-shared" data-id="${escapeHtml(item.id || "")}">삭제</button>
+      </span>
+    </div>`).join("");
     showModal(`<span class="eyebrow">Shared files</span><h2>공유 파일 목록</h2>
-      <p>${state.activeShareIndex >= 0 ? "목록에서 파일을 열려면 먼저 공유 화면을 닫아 주세요." : "파일을 선택하면 비어 있는 공유 화면에 표시합니다."}</p>
+      <p>${state.activeShareIndex >= 0 ? "목록에서 파일을 열려면 먼저 공유 화면을 닫아 주세요. 파일은 각 항목의 삭제 버튼으로 제거할 수 있습니다." : "파일을 열거나 각 항목의 삭제 버튼으로 제거할 수 있습니다."}</p>
       <div class="shared-file-list">${files || `<p class="muted">아직 공유된 파일이 없습니다.</p>`}</div>
       <div class="modal-actions"><button class="button secondary" data-modal-action="cancel">닫기</button></div>`);
   }
 
+  async function deleteSharedItem(index) {
+    const item = state.sharedItems[index];
+    if (!item) return;
+    try {
+      if (state.backendReady) {
+        await backend.deleteSharedFile(activeBooking().id, item.id);
+      }
+      if (item.objectUrl) URL.revokeObjectURL(item.objectUrl);
+      const currentItem = state.sharedItems[state.activeShareIndex];
+      const currentIndex = state.sharedItems.findIndex((candidate) =>
+        candidate === item || (item.id && candidate.id === item.id)
+      );
+      if (currentIndex >= 0) state.sharedItems.splice(currentIndex, 1);
+      state.activeShareIndex = currentItem
+        ? state.sharedItems.findIndex((candidate) =>
+          candidate === currentItem || (currentItem.id && candidate.id === currentItem.id)
+        )
+        : -1;
+      closeModal();
+      renderMeeting();
+      openSharedFilesDialog();
+      toast("공유 파일을 삭제했습니다.");
+    } catch (error) {
+      console.error("Could not delete the shared file.", error);
+      toast(`공유 파일을 삭제하지 못했습니다${error.message ? `: ${error.message}` : "."}`, true);
+    }
+  }
+
   function openParticipantPreview(index) {
-    const participants = state.backendReady
-      ? state.participants.map((participant) => ({
-        name: participant.display_name,
-        self: participant.user_id === state.userId
-      }))
-      : [{ name: state.currentName || "나", self: true }];
+    const participants = meetingParticipants();
     const participant = participants[index];
     const name = participant?.name;
     if (!name) return;
     showModal(`<button class="participant-preview-close" data-modal-action="cancel" aria-label="영상 미리보기 닫기">×</button>
-      <div class="participant-preview">${participant.self && state.cameraEnabled
-        ? `<video class="participant-preview-video" data-local-preview muted autoplay playsinline></video>`
+      <div class="participant-preview">${participant.cameraEnabled && (participant.self ? state.localMediaStream : participant.stream)
+        ? `<video class="participant-preview-video" ${participant.self ? 'data-local-preview' : `data-remote-preview="${escapeHtml(participant.id)}"`} muted autoplay playsinline></video>`
         : `<div class="participant-avatar large">${escapeHtml(name.slice(0, 1))}</div>`}<h2>${escapeHtml(name)}</h2>
-      <p>${participant.self && state.cameraEnabled
-        ? "내 카메라 미리보기"
-        : participant.self
-          ? "카메라를 켜면 내 영상이 표시됩니다."
-          : "상대 참가자의 영상은 실시간 통화 연결 후 표시됩니다."}</p></div>`);
+      <p>${participant.cameraEnabled && (participant.self ? state.localMediaStream : participant.stream)
+        ? participant.self ? "내 카메라 미리보기" : "상대 카메라 영상"
+        : participant.cameraEnabled
+          ? "영상 연결 중입니다."
+          : participant.presence
+            ? "카메라가 꺼져 있습니다."
+            : "상대 참가자의 장치 상태를 확인할 수 없습니다."}</p></div>`);
     modalRoot.querySelector(".modal-card")?.classList.add("participant-preview-dialog");
-    attachLocalPreview();
+    attachMediaPreviews();
   }
 
-  function attachLocalPreview() {
-    if (!state.localMediaStream) return;
+  function meetingParticipants() {
+    const registered = state.backendReady
+      ? state.participants
+      : [{ user_id: state.userId, display_name: state.currentName || "나" }];
+    const presenceById = new Map(state.presenceParticipants.map((participant) => [participant.user_id, participant]));
+    return registered.map((participant) => {
+      const self = participant.user_id === state.userId || (!state.backendReady && !participant.user_id);
+      const presence = self || presenceById.has(participant.user_id);
+      const status = self ? null : presenceById.get(participant.user_id);
+      return {
+        id: participant.user_id || "local",
+        name: participant.display_name,
+        self,
+        presence,
+        cameraEnabled: self ? state.cameraEnabled : Boolean(status?.camera_enabled),
+        microphoneEnabled: self ? state.microphoneEnabled : Boolean(status?.microphone_enabled),
+        stream: self ? state.localMediaStream : state.remoteStreams.get(participant.user_id)
+      };
+    });
+  }
+
+  function attachMediaPreviews() {
     for (const video of document.querySelectorAll("[data-local-preview]")) {
+      if (!state.localMediaStream) continue;
       if (video.srcObject !== state.localMediaStream) video.srcObject = state.localMediaStream;
       void video.play().catch((error) => {
         if (error.name === "AbortError") return;
         console.error("Could not start the local camera preview.", error);
       });
     }
+    for (const video of document.querySelectorAll("[data-remote-preview]")) {
+      const stream = state.remoteStreams.get(video.dataset.remotePreview);
+      if (!stream) continue;
+      if (video.srcObject !== stream) video.srcObject = stream;
+      void video.play().catch((error) => {
+        if (error.name === "AbortError") return;
+        console.error("Could not start a participant camera video.", error);
+      });
+    }
+  }
+
+  function syncPresence() {
+    if (!state.roomChannel || !state.userId) return;
+    void state.roomChannel.updatePresence({
+      display_name: state.currentName,
+      camera_enabled: state.cameraEnabled,
+      microphone_enabled: state.microphoneEnabled
+    }).catch((error) => {
+      console.error("Could not update room media status.", error);
+      toast("카메라·마이크 상태를 참가자에게 전달하지 못했습니다.", true);
+    });
+  }
+
+  async function syncPeerMedia(peer) {
+    for (const sender of peer.senders) {
+      const enabled = sender.kind === "video" ? state.cameraEnabled : state.microphoneEnabled;
+      const track = enabled
+        ? state.localMediaStream?.getTracks()
+          .find((item) => item.kind === sender.kind && item.readyState === "live") || null
+        : null;
+      if (sender.track !== track) await sender.replaceTrack(track);
+    }
+  }
+
+  async function sendPeerOffer(peer) {
+    const connection = peer.connection;
+    if (peer.negotiating || connection.signalingState !== "stable") return;
+    peer.negotiating = true;
+    try {
+      await syncPeerMedia(peer);
+      const offer = await connection.createOffer();
+      await connection.setLocalDescription(offer);
+      await state.roomChannel?.sendSignal(peer.userId, { description: connection.localDescription.toJSON() });
+    } catch (error) {
+      console.error(`Could not create a video connection for participant ${peer.userId}.`, error);
+      toast("상대방과 영상 연결을 시작하지 못했습니다. 네트워크 연결을 확인해 주세요.", true);
+    } finally {
+      peer.negotiating = false;
+    }
+  }
+
+  function createPeerConnection(userId) {
+    const existing = state.peerConnections.get(userId);
+    if (existing) return existing;
+    if (typeof RTCPeerConnection === "undefined") {
+      toast("이 브라우저는 실시간 영상 통화를 지원하지 않습니다.", true);
+      return null;
+    }
+    const connection = new RTCPeerConnection({
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+    });
+    const peer = {
+      userId,
+      connection,
+      senders: [
+        connection.addTransceiver("video", { direction: "sendrecv" }).sender,
+        connection.addTransceiver("audio", { direction: "sendrecv" }).sender
+      ],
+      pendingCandidates: [],
+      negotiating: false
+    };
+    state.peerConnections.set(userId, peer);
+    void syncPeerMedia(peer).catch((error) => {
+      console.error(`Could not attach local media for participant ${userId}.`, error);
+    });
+    connection.onicecandidate = (event) => {
+      if (event.candidate) {
+        void state.roomChannel?.sendSignal(userId, { candidate: event.candidate.toJSON() }).catch((error) => {
+          console.error(`Could not send an ICE candidate to participant ${userId}.`, error);
+        });
+      }
+    };
+    connection.ontrack = (event) => {
+      const stream = event.streams[0] || state.remoteStreams.get(userId) || new MediaStream();
+      if (!event.streams[0] && !stream.getTracks().includes(event.track)) stream.addTrack(event.track);
+      state.remoteStreams.set(userId, stream);
+      event.track.addEventListener("ended", () => {
+        if (state.page === "meeting") renderMeeting();
+      }, { once: true });
+      if (state.page === "meeting") renderMeeting();
+    };
+    connection.onconnectionstatechange = () => {
+      if (connection.connectionState === "failed") {
+        console.error(`Video connection failed for participant ${userId}.`);
+        toast("상대방과 영상 연결이 끊겼습니다. 네트워크나 방화벽 설정을 확인해 주세요.", true);
+      }
+    };
+    if (state.userId.localeCompare(userId) < 0) {
+      connection.onnegotiationneeded = () => { void sendPeerOffer(peer); };
+      void sendPeerOffer(peer);
+    }
+    return peer;
+  }
+
+  async function handlePeerSignal(userId, signal) {
+    const peer = createPeerConnection(userId);
+    if (!peer || !signal) return;
+    const connection = peer.connection;
+    try {
+      if (signal.candidate) {
+        if (connection.remoteDescription) {
+          await connection.addIceCandidate(signal.candidate);
+        } else {
+          peer.pendingCandidates.push(signal.candidate);
+        }
+        return;
+      }
+      if (!signal.description) return;
+      await connection.setRemoteDescription(signal.description);
+      for (const candidate of peer.pendingCandidates.splice(0)) {
+        await connection.addIceCandidate(candidate);
+      }
+      if (signal.description.type === "offer") {
+        await syncPeerMedia(peer);
+        await connection.setLocalDescription(await connection.createAnswer());
+        await state.roomChannel?.sendSignal(userId, { description: connection.localDescription.toJSON() });
+      }
+    } catch (error) {
+      console.error(`Could not process a video signal from participant ${userId}.`, error);
+      toast("상대방의 영상 연결 정보를 처리하지 못했습니다. 다시 입장해 주세요.", true);
+    }
+  }
+
+  function updateRoomPeers(participants) {
+    state.presenceParticipants = participants;
+    const activeIds = new Set(participants.map((participant) => participant.user_id));
+    for (const [userId, peer] of state.peerConnections) {
+      if (!activeIds.has(userId)) {
+        peer.connection.close();
+        state.peerConnections.delete(userId);
+        state.remoteStreams.delete(userId);
+      }
+    }
+    for (const participant of participants) {
+      if (participant.user_id !== state.userId) createPeerConnection(participant.user_id);
+    }
+    if (state.page === "meeting") renderMeeting();
   }
 
   async function toggleDevice(device) {
@@ -997,6 +1227,12 @@
         state.localMediaStream.removeTrack(currentTrack);
         currentTrack.stop();
       }
+      await Promise.all([...state.peerConnections.values()].map((peer) => syncPeerMedia(peer)))
+        .catch((error) => {
+          console.error(`Could not stop sending the ${device} track.`, error);
+          toast(`상대방에게 ${device === "camera" ? "카메라" : "마이크"} 종료 상태를 전달하지 못했습니다.`, true);
+        });
+      syncPresence();
       renderMeeting();
       return;
     }
@@ -1032,10 +1268,12 @@
         state.recognitionStatus = "connecting";
         startSpeechRecognition();
       }
+      await Promise.all([...state.peerConnections.values()].map((peer) => syncPeerMedia(peer)));
+      syncPresence();
       renderMeeting();
     } catch (error) {
+      state[enabledKey] = false;
       if (!isCamera) {
-        state.microphoneEnabled = false;
         state.recognitionStatus = "off";
         stopSpeechRecognition();
         const audioTrack = state.localMediaStream?.getAudioTracks().find((track) => track.readyState === "live");
@@ -1043,7 +1281,15 @@
           state.localMediaStream.removeTrack(audioTrack);
           audioTrack.stop();
         }
+      } else {
+        state.localMediaStream?.getVideoTracks().forEach((videoTrack) => {
+          state.localMediaStream.removeTrack(videoTrack);
+          videoTrack.stop();
+        });
       }
+      syncPresence();
+      void Promise.all([...state.peerConnections.values()].map((peer) => syncPeerMedia(peer)))
+        .catch((syncError) => console.error(`Could not stop sending the ${device} track after a device error.`, syncError));
       console.error(`Could not turn on the ${device}.`, error);
       const message = error.name === "NotAllowedError" || error.name === "PermissionDeniedError"
         ? `${isCamera ? "카메라" : "마이크"} 권한이 거부되었습니다. 브라우저 사이트 설정에서 권한을 허용해 주세요.`
@@ -1106,6 +1352,9 @@
         state.localMediaStream.removeTrack(audioTrack);
         audioTrack.stop();
       }
+      syncPresence();
+      void Promise.all([...state.peerConnections.values()].map((peer) => syncPeerMedia(peer)))
+        .catch((error) => console.error("Could not stop sending audio after a speech recognition error.", error));
       const message = event.error === "not-allowed" || event.error === "service-not-allowed"
         ? "음성 인식 권한이 거부되었습니다. 브라우저의 마이크 및 음성 인식 권한을 확인해 주세요."
         : event.error === "language-not-supported"
@@ -1142,6 +1391,9 @@
               state.localMediaStream.removeTrack(track);
               track.stop();
             });
+            syncPresence();
+            void Promise.all([...state.peerConnections.values()].map((peer) => syncPeerMedia(peer)))
+              .catch((syncError) => console.error("Could not stop sending audio after speech recognition stopped.", syncError));
             toast("자동 음성 인식을 다시 시작하지 못했습니다. 마이크 버튼을 다시 눌러 주세요.", true);
             renderMeeting();
           }
@@ -1430,14 +1682,20 @@
       render();
       await refreshMeetingData("all");
       if (state.unsubscribeRoom) state.unsubscribeRoom();
-      state.unsubscribeRoom = backend.subscribe(booking.id, (change, error) => {
+      state.roomChannel = backend.subscribe(booking.id, {
+        userId: state.userId,
+        displayName: state.currentName,
+        cameraEnabled: state.cameraEnabled,
+        microphoneEnabled: state.microphoneEnabled
+      }, (change, error) => {
         if (change === "error") {
           console.error("Realtime subscription failed.", error);
           toast("실시간 연결이 끊겼습니다. 새로고침 후 다시 입장해 주세요.", true);
         } else {
           void refreshMeetingData(change);
         }
-      });
+      }, (userId, signal) => { void handlePeerSignal(userId, signal); }, updateRoomPeers);
+      state.unsubscribeRoom = () => state.roomChannel?.unsubscribe();
       return;
     }
     if (password !== booking.password) {
@@ -1486,6 +1744,12 @@
       state.unsubscribeRoom();
       state.unsubscribeRoom = null;
     }
+    for (const peer of state.peerConnections.values()) peer.connection.close();
+    state.peerConnections.clear();
+    state.remoteStreams.clear();
+    state.presenceParticipants = [];
+    state.roomChannel = null;
+    state.remoteAudioBlocked = false;
     stopLocalMedia();
     if (state.backendReady && !alreadyEnded) {
       try {
@@ -1840,6 +2104,15 @@
       if (zoomValue) zoomValue.textContent = `${Math.round(state.shareZoom * 100)}%`;
     } else if (action === "toggle-device") {
       await toggleDevice(element.dataset.device);
+    } else if (action === "enable-remote-audio") {
+      try {
+        await Promise.all([...document.querySelectorAll("[data-remote-audio]")].map((audio) => audio.play()));
+        state.remoteAudioBlocked = false;
+        renderMeeting();
+      } catch (error) {
+        console.error("Could not enable participant audio playback.", error);
+        toast("상대방 소리를 재생하지 못했습니다. 브라우저의 소리 재생 권한을 확인해 주세요.", true);
+      }
     } else if (action === "extend") {
       await doExtend();
     } else if (action === "leave") {
@@ -1902,6 +2175,13 @@
       state.shareZoom = 1;
       closeModal();
       render();
+    } else if (action === "ask-delete-shared") {
+      const index = Number(element.closest(".shared-file-row")?.querySelector('[data-modal-action="select-shared"]')?.dataset.index);
+      const item = state.sharedItems[index];
+      if (!item) return;
+      showModal(`<h2>공유 파일을 삭제할까요?</h2><p><strong>${escapeHtml(item.name)}</strong> 파일을 토론방의 공유 목록과 저장소에서 삭제합니다. 이 작업은 되돌릴 수 없습니다.</p><div class="modal-actions"><button class="button secondary" data-modal-action="cancel">취소</button><button class="button danger" data-modal-action="confirm-delete-shared" data-index="${index}">삭제</button></div>`);
+    } else if (action === "confirm-delete-shared") {
+      await deleteSharedItem(Number(element.dataset.index));
     }
   });
 
@@ -1932,6 +2212,9 @@
             state.localMediaStream.removeTrack(audioTrack);
             audioTrack.stop();
           }
+          syncPresence();
+          void Promise.all([...state.peerConnections.values()].map((peer) => syncPeerMedia(peer)))
+            .catch((syncError) => console.error("Could not stop sending audio after changing recognition language.", syncError));
           console.error("Could not restart speech recognition in the selected language.", error);
           toast("선택한 언어로 음성 인식을 시작하지 못했습니다. 마이크가 꺼졌습니다.", true);
           renderMeeting();

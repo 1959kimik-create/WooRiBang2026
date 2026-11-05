@@ -96,6 +96,27 @@
     async downloadSharedFile(storagePath) {
       return unwrap(await client.storage.from("room-shares").download(storagePath));
     },
+    async deleteSharedFile(reservationId, fileId) {
+      const file = unwrap(await client.from("shared_files")
+        .select("storage_path")
+        .eq("id", fileId)
+        .eq("reservation_id", reservationId)
+        .maybeSingle());
+      if (!file) throw new Error("파일 삭제 권한이 없거나 이미 삭제된 파일입니다.");
+      if (file.storage_path) {
+        const { error } = await client.storage.from("room-shares").remove([file.storage_path]);
+        if (error) {
+          error.shareStage = "storage-delete";
+          throw error;
+        }
+      }
+      const deleted = unwrap(await client.from("shared_files")
+        .delete()
+        .eq("id", fileId)
+        .eq("reservation_id", reservationId)
+        .select("id"));
+      if (!deleted.length) throw new Error("파일 삭제 권한이 없거나 이미 삭제된 파일입니다.");
+    },
     async uploadSharedFile(reservationId, file) {
       const { data: { user }, error: userError } = await client.auth.getUser();
       if (userError) throw userError;
@@ -162,8 +183,22 @@
         throw error || new Error("The guest session could not be cleared from this browser.");
       }
     },
-    subscribe(reservationId, onChange) {
-      const channel = client.channel(`room:${reservationId}`)
+    subscribe(reservationId, identity, onChange, onSignal, onPresence) {
+      const topic = `room:${reservationId}`;
+      const channel = client.channel(topic, {
+        config: { private: true, presence: { key: identity.userId } }
+      })
+        .on("broadcast", { event: "signal" }, ({ payload }) => {
+          if (payload?.to === identity.userId && payload.from && payload.signal) {
+            onSignal(payload.from, payload.signal);
+          }
+        })
+        .on("presence", { event: "sync" }, () => {
+          const participants = Object.values(channel.presenceState()).flat()
+            .filter((entry) => entry?.user_id && entry.display_name);
+          const unique = [...new Map(participants.map((entry) => [entry.user_id, entry])).values()];
+          onPresence(unique);
+        })
         .on("postgres_changes", {
           event: "*", schema: "public", table: "room_messages",
           filter: `reservation_id=eq.${reservationId}`
@@ -181,11 +216,41 @@
           filter: `id=eq.${reservationId}`
         }, () => onChange("reservation"))
         .subscribe((status, error) => {
-          if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+          if (status === "SUBSCRIBED") {
+            void channel.track({
+              user_id: identity.userId,
+              display_name: identity.displayName,
+              camera_enabled: identity.cameraEnabled,
+              microphone_enabled: identity.microphoneEnabled
+            }).then(() => {
+              const participants = Object.values(channel.presenceState()).flat()
+                .filter((entry) => entry?.user_id && entry.display_name);
+              onPresence([...new Map(participants.map((entry) => [entry.user_id, entry])).values()]);
+            }).catch((trackError) => onChange("error", trackError));
+          } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
             onChange("error", error || new Error(`Realtime connection ${status.toLowerCase()}.`));
           }
         });
-      return () => { void client.removeChannel(channel); };
+      return {
+        async updatePresence(presence) {
+          const result = await channel.track({
+            user_id: identity.userId,
+            ...presence
+          });
+          if (result !== "ok") throw new Error(`Realtime presence update failed: ${result}`);
+        },
+        async sendSignal(to, signal) {
+          const result = await channel.send({
+            type: "broadcast",
+            event: "signal",
+            payload: { from: identity.userId, to, signal }
+          });
+          if (result !== "ok") throw new Error(`Realtime signal send failed: ${result}`);
+        },
+        unsubscribe() {
+          void client.removeChannel(channel);
+        }
+      };
     }
   };
 })();

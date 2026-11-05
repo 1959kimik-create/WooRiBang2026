@@ -370,12 +370,18 @@ create policy "participants can read shared file metadata"
   on public.shared_files for select to authenticated
   using (public.is_active_room_participant(reservation_id));
 
+drop policy if exists "participants can delete shared file metadata" on public.shared_files;
+create policy "participants can delete shared file metadata"
+  on public.shared_files for delete to authenticated
+  using (public.is_active_room_participant(reservation_id));
+
 grant select on public.rooms to anon, authenticated;
 grant select on public.reservations to authenticated;
 revoke all on public.reservation_secrets from anon, authenticated;
 grant select on public.room_participants to authenticated;
 grant select on public.room_messages to authenticated;
 grant select on public.shared_files to authenticated;
+grant delete on public.shared_files to authenticated;
 
 revoke all on function public.room_schedule(timestamptz, timestamptz) from public;
 grant execute on function public.room_schedule(timestamptz, timestamptz) to anon, authenticated;

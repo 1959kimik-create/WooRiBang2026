@@ -204,6 +204,22 @@ create policy "active room participants can delete shared files"
     and public.is_active_room_participant_path((storage.foldername(name))[1])
   );
 
+drop policy if exists "participants can delete shared file metadata" on public.shared_files;
+create policy "participants can delete shared file metadata"
+  on public.shared_files for delete to authenticated
+  using (public.is_active_room_participant(reservation_id));
+grant delete on public.shared_files to authenticated;
+
+drop policy if exists "active room participants can receive room broadcasts" on realtime.messages;
+create policy "active room participants can receive room broadcasts"
+  on realtime.messages for select to authenticated
+  using (public.is_active_room_participant_path(split_part(realtime.topic(), ':', 2)));
+
+drop policy if exists "active room participants can send room broadcasts" on realtime.messages;
+create policy "active room participants can send room broadcasts"
+  on realtime.messages for insert to authenticated
+  with check (public.is_active_room_participant_path(split_part(realtime.topic(), ':', 2)));
+
 revoke all on function public.room_bookings(text) from public;
 grant execute on function public.room_bookings(text) to anon, authenticated;
 revoke all on function public.reservation_for_entry(uuid) from public;
