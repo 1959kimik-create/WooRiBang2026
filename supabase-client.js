@@ -166,9 +166,25 @@
       return unwrap(await client.rpc("leave_room", { p_reservation_id: reservationId }));
     },
     async cleanupRoom(reservationId) {
-      return unwrap(await client.functions.invoke("cleanup-room", {
+      const result = await client.functions.invoke("cleanup-room", {
         body: { reservation_id: reservationId }
-      }));
+      });
+      if (result.error) {
+        const context = result.error.context;
+        if (context instanceof Response) {
+          const body = await context.clone().text();
+          if (body) {
+            try {
+              const payload = JSON.parse(body);
+              if (typeof payload.error === "string") result.error.message = payload.error;
+            } catch {
+              result.error.message = body.slice(0, 240);
+            }
+          }
+        }
+        throw result.error;
+      }
+      return result.data;
     },
     async discardUnusedGuest() {
       return unwrap(await client.functions.invoke("cleanup-room", {

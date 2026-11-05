@@ -1791,6 +1791,8 @@
       if (!downloaded) return;
     }
     let cleanupPending = false;
+    let cleanupError = null;
+    let cleanupFailureStage = null;
     if (state.unsubscribeRoom) {
       state.unsubscribeRoom();
       state.unsubscribeRoom = null;
@@ -1807,10 +1809,14 @@
         const isLastParticipant = await backend.leave(booking.id);
         if (isLastParticipant) {
           state.pendingCleanupId = booking.id;
+          cleanupFailureStage = "function";
           await finishServerCleanup(booking.id);
         }
       } catch (error) {
         cleanupPending = true;
+        cleanupError = error;
+        if (cleanupFailureStage === "function" && !state.pendingCleanupId) cleanupFailureStage = "session";
+        if (!cleanupFailureStage) cleanupFailureStage = "leave";
         console.error("Could not complete server-side room cleanup.", error);
       }
     }
@@ -1820,6 +1826,8 @@
         state.userId = null;
       } catch (error) {
         cleanupPending = true;
+        cleanupError = error;
+        cleanupFailureStage = "session";
         state.backendReady = false;
         state.backendStatus = "error";
         console.error("Could not refresh guest session after room cleanup.", error);
@@ -1835,7 +1843,15 @@
     state.page = "home";
     render();
     if (cleanupPending) {
-      toast("방에서 나왔지만 서버 임시 자료 정리가 완료되지 않았습니다. Supabase cleanup-room 함수 배포 여부를 확인하세요.", true);
+      const detail = cleanupError instanceof Error && cleanupError.message
+        ? ` 오류: ${cleanupError.message.slice(0, 180)}`
+        : "";
+      const guidance = cleanupFailureStage === "leave"
+        ? "퇴장 기록 저장에 실패했습니다. 네트워크와 Supabase RPC를 확인해 주세요."
+        : cleanupFailureStage === "session"
+          ? "세션을 초기화하지 못했습니다. 페이지를 새로고침해 주세요."
+          : "홈 화면에서 정리 재시도를 선택하거나 Supabase 함수 로그를 확인해 주세요.";
+      toast(`방에서 나왔지만 서버 정리가 완료되지 않았습니다.${detail} ${guidance}`, true);
     } else {
       toast(`${room} 토론방을 나왔습니다. ${state.backendReady ? "다른 참가자가 남아 있어 방은 계속 진행 중입니다." : "임시 자료를 삭제했습니다."}${save ? " 선택한 결과물은 PC에 다운로드되었습니다." : ""}`);
     }
@@ -1843,11 +1859,11 @@
 
   async function finishServerCleanup(reservationId) {
     await backend.cleanupRoom(reservationId);
-    await backend.signOutAndForget();
     state.pendingCleanupId = null;
     state.backendReady = true;
     state.backendStatus = "connected";
     state.userId = null;
+    await backend.signOutAndForget();
   }
 
   async function downloadSession(booking) {
@@ -2177,7 +2193,14 @@
         toast("회의의 서버 임시 자료를 삭제했습니다.");
       } catch (error) {
         console.error("Room cleanup retry failed.", error);
-        toast("정리 재시도에 실패했습니다. 네트워크와 cleanup-room 함수 배포를 확인해 주세요.", true);
+        render();
+        const detail = error instanceof Error && error.message
+          ? ` 오류: ${error.message.slice(0, 180)}`
+          : "";
+        const guidance = state.pendingCleanupId
+          ? "Supabase 함수 로그를 확인해 주세요."
+          : "서버 정리는 완료됐을 수 있습니다. 페이지를 새로고침해 세션을 초기화해 주세요.";
+        toast(`정리 재시도에 실패했습니다.${detail} ${guidance}`, true);
       }
     }
   }
