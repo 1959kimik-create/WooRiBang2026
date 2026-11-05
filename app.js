@@ -1087,11 +1087,11 @@
   }
 
   async function syncPeerMedia(peer) {
-    for (const sender of peer.senders) {
-      const enabled = sender.kind === "video" ? state.cameraEnabled : state.microphoneEnabled;
+    for (const { kind, sender } of peer.senders) {
+      const enabled = kind === "video" ? state.cameraEnabled : state.microphoneEnabled;
       const track = enabled
         ? state.localMediaStream?.getTracks()
-          .find((item) => item.kind === sender.kind && item.readyState === "live") || null
+          .find((item) => item.kind === kind && item.readyState === "live") || null
         : null;
       if (sender.track !== track) await sender.replaceTrack(track);
     }
@@ -1128,8 +1128,8 @@
       userId,
       connection,
       senders: [
-        connection.addTransceiver("video", { direction: "sendrecv" }).sender,
-        connection.addTransceiver("audio", { direction: "sendrecv" }).sender
+        { kind: "video", sender: connection.addTransceiver("video", { direction: "sendrecv" }).sender },
+        { kind: "audio", sender: connection.addTransceiver("audio", { direction: "sendrecv" }).sender }
       ],
       pendingCandidates: [],
       negotiating: false
