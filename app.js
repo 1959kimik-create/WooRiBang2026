@@ -35,7 +35,6 @@
     backendReady: false,
     backendStatus: window.roomBackend?.available ? "connecting" : "local",
     userId: null,
-    participants: [],
     messages: [],
     sharedItems: [],
     activeShareIndex: 0,
@@ -175,9 +174,6 @@
           mine: row.sender_id === state.userId,
           voice: row.input_type === "voice"
         }));
-      }
-      if (change === "all" || change === "participants") {
-        state.participants = await backend.participants(booking.id);
       }
       if (change === "all" || change === "shared") {
         const currentShareId = state.sharedItems[state.activeShareIndex]?.id;
@@ -722,6 +718,15 @@
   }
 
   function renderMeeting() {
+    const previousChatLog = document.querySelector("#chat-log");
+    const chatScrollTop = previousChatLog?.scrollTop || 0;
+    const chatInput = document.querySelector("#chat-input");
+    const preserveChatInput = document.activeElement === chatInput;
+    const chatDraft = preserveChatInput ? chatInput.value : "";
+    const chatSelection = preserveChatInput
+      ? [chatInput.selectionStart, chatInput.selectionEnd, chatInput.selectionDirection]
+      : null;
+    const pageScroll = [window.scrollX, window.scrollY];
     const booking = activeBooking();
     if (!booking) {
       state.page = "home";
@@ -809,12 +814,21 @@
       </section>
       <input class="visually-hidden" id="share-file-input" type="file" accept="image/*,video/*,application/pdf,text/plain,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.zip">
     </main>`;
+    const nextChatInput = document.querySelector("#chat-input");
+    if (preserveChatInput && nextChatInput) {
+      nextChatInput.value = chatDraft;
+      nextChatInput.focus({ preventScroll: true });
+      nextChatInput.setSelectionRange(chatSelection[0], chatSelection[1], chatSelection[2]);
+    }
+    window.scrollTo(pageScroll[0], pageScroll[1]);
     attachMediaPreviews();
     if (remoteAudio) {
       for (const audio of document.querySelectorAll("[data-remote-audio]")) {
         const stream = state.remoteStreams.get(audio.dataset.remoteAudio);
         if (!stream) continue;
         if (audio.srcObject !== stream) audio.srcObject = stream;
+        audio.muted = false;
+        audio.volume = 1;
         void audio.play().then(() => {
           if (state.remoteAudioBlocked) {
             state.remoteAudioBlocked = false;
@@ -833,7 +847,7 @@
       }
     }
     const log = document.querySelector("#chat-log");
-    if (log) log.scrollTop = log.scrollHeight;
+    if (log) log.scrollTop = chatScrollTop;
     updateMeetingClock();
   }
 
@@ -933,6 +947,7 @@
         state.localMediaStream.addTrack(nextTrack);
         watchMicrophoneTrack(nextTrack);
         await Promise.all([...state.peerConnections.values()].map((peer) => syncPeerMedia(peer)));
+        await Promise.all([...state.peerConnections.values()].map((peer) => requestPeerNegotiation(peer)));
         toast("연결된 사용 가능 마이크로 자동 전환했습니다.");
       } catch (error) {
         console.error("Could not switch to another available microphone.", error);
@@ -1034,22 +1049,27 @@
   }
 
   function meetingParticipants() {
-    const registered = state.backendReady
-      ? state.participants
-      : [{ user_id: state.userId, display_name: state.currentName || "나" }];
-    const presenceById = new Map(state.presenceParticipants.map((participant) => [participant.user_id, participant]));
-    return registered.map((participant) => {
-      const self = participant.user_id === state.userId || (!state.backendReady && !participant.user_id);
-      const presence = self || presenceById.has(participant.user_id);
-      const status = self ? null : presenceById.get(participant.user_id);
+    if (!state.backendReady) {
+      return [{
+        id: "local",
+        name: state.currentName || "나",
+        self: true,
+        presence: true,
+        cameraEnabled: state.cameraEnabled,
+        microphoneEnabled: state.microphoneEnabled,
+        stream: state.localMediaStream
+      }];
+    }
+    return state.presenceParticipants.map((status) => {
+      const self = status.user_id === state.userId;
       return {
-        id: participant.user_id || "local",
-        name: participant.display_name,
+        id: status.user_id,
+        name: status.display_name,
         self,
-        presence,
-        cameraEnabled: self ? state.cameraEnabled : Boolean(status?.camera_enabled),
-        microphoneEnabled: self ? state.microphoneEnabled : Boolean(status?.microphone_enabled),
-        stream: self ? state.localMediaStream : state.remoteStreams.get(participant.user_id)
+        presence: true,
+        cameraEnabled: self ? state.cameraEnabled : Boolean(status.camera_enabled),
+        microphoneEnabled: self ? state.microphoneEnabled : Boolean(status.microphone_enabled),
+        stream: self ? state.localMediaStream : state.remoteStreams.get(status.user_id)
       };
     });
   }
@@ -1097,10 +1117,24 @@
     }
   }
 
+  async function requestPeerNegotiation(peer) {
+    if (state.userId.localeCompare(peer.userId) < 0) {
+      peer.needsNegotiation = true;
+      await sendPeerOffer(peer);
+    } else {
+      await state.roomChannel?.sendSignal(peer.userId, { renegotiate: true });
+    }
+  }
+
   async function sendPeerOffer(peer) {
     const connection = peer.connection;
-    if (peer.negotiating || connection.signalingState !== "stable") return;
+    if (peer.negotiating) return;
+    if (connection.signalingState !== "stable") {
+      peer.needsNegotiation = true;
+      return;
+    }
     peer.negotiating = true;
+    peer.needsNegotiation = false;
     try {
       await syncPeerMedia(peer);
       const offer = await connection.createOffer();
@@ -1111,6 +1145,9 @@
       toast("상대방과 영상 연결을 시작하지 못했습니다. 네트워크 연결을 확인해 주세요.", true);
     } finally {
       peer.negotiating = false;
+      if (peer.needsNegotiation && connection.signalingState === "stable") {
+        queueMicrotask(() => { void sendPeerOffer(peer); });
+      }
     }
   }
 
@@ -1132,7 +1169,8 @@
         { kind: "audio", sender: connection.addTransceiver("audio", { direction: "sendrecv" }).sender }
       ],
       pendingCandidates: [],
-      negotiating: false
+      negotiating: false,
+      needsNegotiation: false
     };
     state.peerConnections.set(userId, peer);
     void syncPeerMedia(peer).catch((error) => {
@@ -1146,8 +1184,9 @@
       }
     };
     connection.ontrack = (event) => {
-      const stream = event.streams[0] || state.remoteStreams.get(userId) || new MediaStream();
-      if (!event.streams[0] && !stream.getTracks().includes(event.track)) stream.addTrack(event.track);
+      const stream = state.remoteStreams.get(userId) || new MediaStream();
+      if (!stream.getTracks().includes(event.track)) stream.addTrack(event.track);
+      if (event.track.kind === "audio") event.track.enabled = true;
       state.remoteStreams.set(userId, stream);
       event.track.addEventListener("ended", () => {
         if (state.page === "meeting") renderMeeting();
@@ -1158,6 +1197,11 @@
       if (connection.connectionState === "failed") {
         console.error(`Video connection failed for participant ${userId}.`);
         toast("상대방과 영상 연결이 끊겼습니다. 네트워크나 방화벽 설정을 확인해 주세요.", true);
+      }
+    };
+    connection.onsignalingstatechange = () => {
+      if (connection.signalingState === "stable" && peer.needsNegotiation) {
+        queueMicrotask(() => { void sendPeerOffer(peer); });
       }
     };
     if (state.userId.localeCompare(userId) < 0) {
@@ -1172,6 +1216,13 @@
     if (!peer || !signal) return;
     const connection = peer.connection;
     try {
+      if (signal.renegotiate) {
+        if (state.userId.localeCompare(userId) < 0) {
+          peer.needsNegotiation = true;
+          await sendPeerOffer(peer);
+        }
+        return;
+      }
       if (signal.candidate) {
         if (connection.remoteDescription) {
           await connection.addIceCandidate(signal.candidate);
@@ -1269,6 +1320,7 @@
         startSpeechRecognition();
       }
       await Promise.all([...state.peerConnections.values()].map((peer) => syncPeerMedia(peer)));
+      await Promise.all([...state.peerConnections.values()].map((peer) => requestPeerNegotiation(peer)));
       syncPresence();
       renderMeeting();
     } catch (error) {
@@ -1676,7 +1728,6 @@
       state.currentName = name;
       state.page = "meeting";
       state.messages = [];
-      state.participants = [];
       state.sharedItems = [];
       state.activeShareIndex = -1;
       render();
@@ -1778,7 +1829,6 @@
     state.bookings = state.bookings.filter((item) => item.id !== booking.id);
     state.activeBookingId = null;
     state.messages = [];
-    state.participants = [];
     clearObjectUrls();
     state.sharedItems = [];
     state.currentName = "";

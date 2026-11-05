@@ -204,10 +204,6 @@
           filter: `reservation_id=eq.${reservationId}`
         }, () => onChange("messages"))
         .on("postgres_changes", {
-          event: "*", schema: "public", table: "room_participants",
-          filter: `reservation_id=eq.${reservationId}`
-        }, () => onChange("participants"))
-        .on("postgres_changes", {
           event: "*", schema: "public", table: "shared_files",
           filter: `reservation_id=eq.${reservationId}`
         }, () => onChange("shared"))
