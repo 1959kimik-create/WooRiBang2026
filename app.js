@@ -856,6 +856,7 @@
     if (state.recognitionStatus === "listening") return "마이크 연결됨 · 음성 인식 중입니다.";
     if (state.recognitionStatus === "reconnecting") return "마이크 연결됨 · 브라우저 음성 인식 서비스를 다시 연결하고 있습니다.";
     if (state.recognitionStatus === "service-unavailable") return "마이크는 연결됐지만 음성 인식 서비스에 연결되지 않습니다. 인터넷 연결과 브라우저의 음성 인식 서비스 접근을 확인해 주세요.";
+    if (state.recognitionStatus === "unavailable") return "통화 마이크는 켜져 있습니다. 자동 음성 입력은 사용할 수 없으니 대화창에 직접 입력해 주세요.";
     return "마이크 연결됨 · 음성 인식 서비스를 시작하고 있습니다.";
   }
 
@@ -930,12 +931,6 @@
         }
         stopSpeechRecognition();
         recognitionStopped = true;
-        try {
-          startSpeechRecognition(nextTrack);
-        } catch (error) {
-          for (const track of stream.getTracks()) track.stop();
-          throw error;
-        }
         if (!state.localMediaStream) state.localMediaStream = new MediaStream();
         for (const track of state.localMediaStream.getAudioTracks()) {
           state.localMediaStream.removeTrack(track);
@@ -946,6 +941,7 @@
         }
         state.localMediaStream.addTrack(nextTrack);
         watchMicrophoneTrack(nextTrack);
+        startSpeechRecognitionSafely(nextTrack);
         await Promise.all([...state.peerConnections.values()].map((peer) => syncPeerMedia(peer)));
         await Promise.all([...state.peerConnections.values()].map((peer) => requestPeerNegotiation(peer)));
         toast("연결된 사용 가능 마이크로 자동 전환했습니다.");
@@ -954,13 +950,7 @@
         if (nextTrack?.readyState === "live" && !state.localMediaStream?.getTracks().includes(nextTrack)) nextTrack.stop();
         if (currentTrack?.readyState === "live") {
           if (recognitionStopped) {
-            try {
-              startSpeechRecognition(currentTrack);
-            } catch (restartError) {
-              console.error("Could not resume speech recognition on the current microphone.", restartError);
-              state.microphoneEnabled = false;
-              stopSpeechRecognition();
-            }
+            startSpeechRecognitionSafely(currentTrack);
           }
         } else {
           state.microphoneEnabled = false;
@@ -1289,9 +1279,6 @@
     }
 
     try {
-      if (!isCamera && !(window.SpeechRecognition || window.webkitSpeechRecognition)) {
-        throw new Error("이 브라우저는 자동 음성 인식을 지원하지 않습니다. 최신 Chrome 또는 Edge를 사용해 주세요.");
-      }
       if (currentTrack) {
         currentTrack.enabled = true;
       } else {
@@ -1317,7 +1304,7 @@
         state.recognitionRetryCount = 0;
         state.recognitionNetworkNoticeShown = false;
         state.recognitionStatus = "connecting";
-        startSpeechRecognition();
+        startSpeechRecognitionSafely();
       }
       await Promise.all([...state.peerConnections.values()].map((peer) => syncPeerMedia(peer)));
       await Promise.all([...state.peerConnections.values()].map((peer) => requestPeerNegotiation(peer)));
@@ -1396,23 +1383,15 @@
         }
         return;
       }
-      state.microphoneEnabled = false;
-      state.recognitionStatus = "off";
+      state.recognitionStatus = "unavailable";
       stopSpeechRecognition();
-      const audioTrack = state.localMediaStream?.getAudioTracks().find((track) => track.readyState === "live");
-      if (audioTrack) {
-        state.localMediaStream.removeTrack(audioTrack);
-        audioTrack.stop();
-      }
-      syncPresence();
-      void Promise.all([...state.peerConnections.values()].map((peer) => syncPeerMedia(peer)))
-        .catch((error) => console.error("Could not stop sending audio after a speech recognition error.", error));
       const message = event.error === "not-allowed" || event.error === "service-not-allowed"
-        ? "음성 인식 권한이 거부되었습니다. 브라우저의 마이크 및 음성 인식 권한을 확인해 주세요."
+        ? "자동 음성 인식 권한이 거부되었습니다. 통화 마이크는 계속 켜져 있습니다."
         : event.error === "language-not-supported"
-          ? "선택한 언어의 음성 인식을 지원하지 않습니다."
-          : "음성을 인식하지 못했습니다. 네트워크와 마이크 권한을 확인해 주세요.";
+          ? "선택한 언어의 음성 인식을 지원하지 않습니다. 통화 마이크는 계속 켜져 있습니다."
+          : "자동 음성 인식을 사용할 수 없습니다. 통화 마이크는 계속 켜져 있습니다.";
       toast(message, true);
+      updateVoiceStatus();
       if (state.page === "meeting") renderMeeting();
     };
     recognition.onend = () => {
@@ -1438,22 +1417,32 @@
             startSpeechRecognition(currentTrack);
           } catch (error) {
             console.error("Could not resume automatic speech recognition.", error);
-            state.microphoneEnabled = false;
-            state.localMediaStream?.getAudioTracks().forEach((track) => {
-              state.localMediaStream.removeTrack(track);
-              track.stop();
-            });
-            syncPresence();
-            void Promise.all([...state.peerConnections.values()].map((peer) => syncPeerMedia(peer)))
-              .catch((syncError) => console.error("Could not stop sending audio after speech recognition stopped.", syncError));
-            toast("자동 음성 인식을 다시 시작하지 못했습니다. 마이크 버튼을 다시 눌러 주세요.", true);
+            state.recognitionStatus = "unavailable";
+            updateVoiceStatus();
+            toast("자동 음성 인식을 다시 시작하지 못했습니다. 통화 마이크는 계속 켜져 있습니다.", true);
             renderMeeting();
           }
         }
       }, delay);
     };
     if (!audioTrack) throw new Error("선택한 마이크의 오디오 트랙을 찾을 수 없습니다.");
-    recognition.start(audioTrack);
+    try {
+      recognition.start(audioTrack);
+    } catch (error) {
+      if (state.recognition === recognition) state.recognition = null;
+      throw error;
+    }
+  }
+
+  function startSpeechRecognitionSafely(audioTrack) {
+    try {
+      startSpeechRecognition(audioTrack);
+    } catch (error) {
+      console.error("Could not start automatic speech recognition.", error);
+      state.recognitionStatus = "unavailable";
+      updateVoiceStatus();
+      toast("자동 음성 인식을 사용할 수 없습니다. 통화 마이크는 계속 켜져 있습니다.", true);
+    }
   }
 
   function stopSpeechRecognition() {
@@ -2275,23 +2264,7 @@
       if (status) status.textContent = `선택 언어: ${state.language === "ko" ? "한국어" : "English"} · 자동 번역은 다음 단계에서 연결됩니다.`;
       if (state.microphoneEnabled) {
         stopSpeechRecognition();
-        try {
-          startSpeechRecognition();
-        } catch (error) {
-          state.microphoneEnabled = false;
-          state.recognitionStatus = "off";
-          const audioTrack = state.localMediaStream?.getAudioTracks().find((track) => track.readyState === "live");
-          if (audioTrack) {
-            state.localMediaStream.removeTrack(audioTrack);
-            audioTrack.stop();
-          }
-          syncPresence();
-          void Promise.all([...state.peerConnections.values()].map((peer) => syncPeerMedia(peer)))
-            .catch((syncError) => console.error("Could not stop sending audio after changing recognition language.", syncError));
-          console.error("Could not restart speech recognition in the selected language.", error);
-          toast("선택한 언어로 음성 인식을 시작하지 못했습니다. 마이크가 꺼졌습니다.", true);
-          renderMeeting();
-        }
+        startSpeechRecognitionSafely();
       }
     } else if (event.target.id === "booking-date") {
       const value = event.target.value;
